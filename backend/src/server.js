@@ -5,6 +5,7 @@ import { fileURLToPath } from 'url'
 import { dirname } from 'path'
 import apiRoutes from './routes/api.js'
 import { errorHandler, sanitizeInput, rateLimit } from './middleware/errorHandler.js'
+import connectDatabase from './config/database.js'
 
 dotenv.config()
 
@@ -36,10 +37,23 @@ app.get('/api/status', (req, res) => {
 // Error handling middleware (must be last)
 app.use(errorHandler)
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Phaze AI Backend running on http://localhost:${PORT}`)
-  console.log(`📡 API available at http://localhost:${PORT}/api`)
-})
+// Start server with database connection
+const startServer = async () => {
+  try {
+    // Initialize database connection
+    await connectDatabase()
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Phaze AI Backend running on http://localhost:${PORT}`)
+      console.log(`📡 API available at http://localhost:${PORT}/api`)
+      console.log(`NODE_ENV: ${process.env.NODE_ENV}`)
+    })
+  } catch (error) {
+    console.error('❌ Failed to start server:', error.message)
+    process.exit(1)
+  }
+}
+
+startServer()
 
 export default app
