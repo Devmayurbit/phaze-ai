@@ -1,90 +1,53 @@
-// Error handling middleware
-export const errorHandler = (err, req, res, next) => {
-  console.error('Error:', err);
+/**
+ * Error handling middleware + custom error classes
+ */
 
-  if (err.name === 'ValidationError') {
-    return res.status(400).json({
-      error: 'Validation error',
-      details: err.message,
-    });
+export class AppError extends Error {
+  constructor(message, statusCode = 500) {
+    super(message)
+    this.statusCode = statusCode
+    this.isOperational = true
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message) { super(message, 400) }
+}
+
+export class AuthError extends AppError {
+  constructor(message = 'Unauthorized') { super(message, 401) }
+}
+
+export class NotFoundError extends AppError {
+  constructor(resource = 'Resource') { super(`${resource} not found`, 404) }
+}
+
+export class RateLimitError extends AppError {
+  constructor() { super('Too many requests, slow down', 429) }
+}
+
+export function notFound(req, res, next) {
+  next(new NotFoundError(`Route ${req.originalUrl}`))
+}
+
+export function errorHandler(err, req, res, _next) {
+  const statusCode = err.statusCode || 500
+  const message = err.isOperational ? err.message : 'Internal server error'
+
+  if (process.env.NODE_ENV !== 'production') {
+    console.error(`[ERROR] ${statusCode} ${req.method} ${req.path}: ${err.message}`)
+    if (!err.isOperational) console.error(err.stack)
   }
 
-  if (err.name === 'CastError') {
-    return res.status(400).json({
-      error: 'Invalid ID format',
-    });
-  }
+  res.status(statusCode).json({
+    success: false,
+    error: message,
+    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
+  })
+}
 
-  if (err.name === 'MongoError' && err.code === 11000) {
-    return res.status(409).json({
-      error: 'Duplicate entry',
-    });
-  }
-
-  res.status(err.status || 500).json({
-    error: err.message || 'Internal server error',
-  });
-};
-
-// Request sanitization middleware
-export const sanitizeInput = (req, res, next) => {
-  if (req.body) {
-    Object.keys(req.body).forEach((key) => {
-      if (typeof req.body[key] === 'string') {
-        req.body[key] = req.body[key].trim();
-      }
-    });
-  }
-
-  if (req.params) {
-    Object.keys(req.params).forEach((key) => {
-      if (typeof req.params[key] === 'string') {
-        req.params[key] = req.params[key].trim().toLowerCase();
-      }
-    });
-  }
-
-  next();
-};
-
-// Rate limiting middleware (simple in-memory implementation)
-const requestCounts = new Map();
-
-export const rateLimit = (maxRequests = 30, windowMs = 60000) => {
+export function asyncHandler(fn) {
   return (req, res, next) => {
-    const ip = req.ip || req.connection.remoteAddress;
-    const now = Date.now();
-
-    if (!requestCounts.has(ip)) {
-      requestCounts.set(ip, []);
-    }
-
-    const requests = requestCounts.get(ip);
-
-    // Remove requests outside the window
-    const validRequests = requests.filter((time) => now - time < windowMs);
-
-    if (validRequests.length >= maxRequests) {
-      return res.status(429).json({
-        error: 'Too many requests. Please try again later.',
-      });
-    }
-
-    validRequests.push(now);
-    requestCounts.set(ip, validRequests);
-
-    next();
-  };
-};
-
-// Async error wrapper
-export const asyncHandler = (fn) => (req, res, next) => {
-  Promise.resolve(fn(req, res, next)).catch(next);
-};
-
-export default {
-  errorHandler,
-  sanitizeInput,
-  rateLimit,
-  asyncHandler,
-};
+    Promise.resolve(fn(req, res, next)).catch(next)
+  }
+}

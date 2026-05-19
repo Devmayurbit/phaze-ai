@@ -1,698 +1,146 @@
-/**
- * ============================================================================
- * ADVANCED AI CONTENT CONTROLLER
- * ============================================================================
- * Comprehensive controller for AI-powered content generation including:
- * - Dynamic content generation with multiple AI strategies
- * - Advanced caching and optimization
- * - Request queuing and processing
- * - Performance monitoring and analytics
- * - Error recovery and fallback mechanisms
- * ============================================================================
- */
-
-import { v4 as uuidv4 } from 'uuid'
-import aiContentGenerator from '../services/aiContentGenerator.js'
-import dynamicPromptBuilder from '../services/dynamicPromptBuilder.js'
-import instagramAnalyzer from '../services/instagramAnalyzer.js'
-import trendAnalyzer from '../services/trendAnalyzer.js'
-import GeneratedScript from '../models/GeneratedScript.js'
-import Analytics from '../models/Analytics.js'
+import agentOrchestrator from '../services/ai/agentOrchestrator.js'
+import CreatorProfile from '../models/CreatorProfile.js'
+import Content from '../models/Content.js'
+import User from '../models/User.js'
+import { asyncHandler, AppError } from '../middleware/errorHandler.js'
 
 /**
- * Advanced Logging System
+ * POST /api/ai/generate
  */
-class AIControllerLogger {
-  constructor() {
-    this.requestLog = []
-    this.performanceMetrics = new Map()
+export const generateContent = asyncHandler(async (req, res) => {
+  const { contentType, topic, niche, count, duration } = req.body
+  const userId = req.user.id
+
+  const user = await User.findById(userId)
+  const usage = user.checkUsageLimit()
+  if (!usage.canGenerate) {
+    throw new AppError(`Daily limit reached (${usage.limit}). Resets tomorrow.`, 429)
   }
 
-  log(level, message, data = {}) {
-    const timestamp = new Date().toISOString()
-    const logEntry = {
-      timestamp,
-      level,
-      message,
-      ...data
-    }
-    console.log(`[${level}] [AI Controller] ${message}`, data)
-    return logEntry
-  }
+  const creatorProfile = await CreatorProfile.findOne({ userId })
 
-  info(message, data) { return this.log('INFO', message, data) }
-  warn(message, data) { return this.log('WARN', message, data) }
-  error(message, data) { return this.log('ERROR', message, data) }
-  debug(message, data) { return this.log('DEBUG', message, data) }
-
-  recordPerformance(operation, duration, success) {
-    if (!this.performanceMetrics.has(operation)) {
-      this.performanceMetrics.set(operation, {
-        total: 0,
-        successful: 0,
-        failed: 0,
-        totalDuration: 0,
-        avgDuration: 0,
-        minDuration: Infinity,
-        maxDuration: 0
-      })
-    }
-
-    const metrics = this.performanceMetrics.get(operation)
-    metrics.total++
-    if (success) metrics.successful++
-    else metrics.failed++
-    metrics.totalDuration += duration
-    metrics.avgDuration = metrics.totalDuration / metrics.total
-    metrics.minDuration = Math.min(metrics.minDuration, duration)
-    metrics.maxDuration = Math.max(metrics.maxDuration, duration)
-  }
-
-  getMetrics(operation) {
-    return this.performanceMetrics.get(operation) || null
-  }
-}
-
-const logger = new AIControllerLogger()
-
-/**
- * Content Cache Manager
- */
-class ContentCacheManager {
-  constructor(maxSize = 1000, ttl = 3600000) {
-    this.cache = new Map()
-    this.maxSize = maxSize
-    this.ttl = ttl // 1 hour
-    this.hits = 0
-    this.misses = 0
-  }
-
-  generateKey(...params) {
-    return params.map(p => {
-      if (typeof p === 'object') return JSON.stringify(p)
-      return String(p)
-    }).join(':')
-  }
-
-  set(key, value) {
-    // Evict oldest entry if cache is full
-    if (this.cache.size >= this.maxSize) {
-      const firstKey = this.cache.keys().next().value
-      this.cache.delete(firstKey)
-    }
-
-    this.cache.set(key, {
-      value,
-      timestamp: Date.now(),
-      accessCount: 0
-    })
-  }
-
-  get(key) {
-    const entry = this.cache.get(key)
-    if (!entry) {
-      this.misses++
-      return null
-    }
-
-    // Check if expired
-    if (Date.now() - entry.timestamp > this.ttl) {
-      this.cache.delete(key)
-      this.misses++
-      return null
-    }
-
-    entry.accessCount++
-    this.hits++
-    return entry.value
-  }
-
-  has(key) {
-    return this.cache.has(key) && (Date.now() - this.cache.get(key).timestamp <= this.ttl)
-  }
-
-  clear() {
-    this.cache.clear()
-    this.hits = 0
-    this.misses = 0
-  }
-
-  getStats() {
-    return {
-      size: this.cache.size,
-      maxSize: this.maxSize,
-      hitRate: this.hits / (this.hits + this.misses) || 0,
-      hits: this.hits,
-      misses: this.misses,
-      items: Array.from(this.cache.entries()).map(([key, entry]) => ({
-        key,
-        accessCount: entry.accessCount,
-        age: `${Math.round((Date.now() - entry.timestamp) / 1000)}s`
-      }))
-    }
-  }
-}
-
-const contentCache = new ContentCacheManager(1000, 3600000)
-
-/**
- * Request Queue Manager
- */
-class RequestQueueManager {
-  constructor(maxConcurrent = 5) {
-    this.queue = []
-    this.processing = new Map()
-    this.maxConcurrent = maxConcurrent
-    this.completed = []
-  }
-
-  async enqueue(requestId, fn, priority = 0) {
-    return new Promise((resolve, reject) => {
-      this.queue.push({
-        id: requestId,
-        fn,
-        priority,
-        resolve,
-        reject,
-        enqueuedAt: Date.now()
-      })
-
-      this.queue.sort((a, b) => b.priority - a.priority)
-      this.processQueue()
-    })
-  }
-
-  async processQueue() {
-    if (this.processing.size >= this.maxConcurrent) {
-      return
-    }
-
-    const job = this.queue.shift()
-    if (!job) return
-
-    this.processing.set(job.id, {
-      startTime: Date.now(),
-      priority: job.priority
-    })
-
-    try {
-      const result = await job.fn()
-      this.completed.push({
-        id: job.id,
-        status: 'completed',
-        duration: Date.now() - this.processing.get(job.id).startTime
-      })
-      job.resolve(result)
-    } catch (error) {
-      this.completed.push({
-        id: job.id,
-        status: 'failed',
-        error: error.message,
-        duration: Date.now() - this.processing.get(job.id).startTime
-      })
-      job.reject(error)
-    } finally {
-      this.processing.delete(job.id)
-      this.processQueue()
-    }
-  }
-
-  getStatus(requestId) {
-    if (this.processing.has(requestId)) {
-      const proc = this.processing.get(requestId)
-      return {
-        status: 'processing',
-        duration: Date.now() - proc.startTime,
-        priority: proc.priority
-      }
-    }
-
-    const completed = this.completed.find(c => c.id === requestId)
-    if (completed) return completed
-
-    return { status: 'unknown' }
-  }
-
-  getMetrics() {
-    return {
-      queueLength: this.queue.length,
-      processing: this.processing.size,
-      maxConcurrent: this.maxConcurrent,
-      completed: this.completed.length,
-      completedRecent: this.completed.slice(-100)
-    }
-  }
-}
-
-const requestQueue = new RequestQueueManager(5)
-
-/**
- * ============================================================================
- * CONTROLLER METHODS
- * ============================================================================
- */
-
-/**
- * Generate viral hooks for content creation
- */
-export const generateHooks = async (req, res, next) => {
   const startTime = Date.now()
-  const requestId = uuidv4()
-
-  try {
-    const { profileData, niche = 'general', count = 10, style = 'viral' } = req.body
-
-    // Validation
-    if (!profileData || typeof profileData !== 'object') {
-      return res.status(400).json({
-        error: 'Invalid profile data',
-        requestId
-      })
-    }
-
-    // Check cache
-    const cacheKey = contentCache.generateKey('hooks', profileData.username, count, style)
-    const cachedHooks = contentCache.get(cacheKey)
-
-    if (cachedHooks) {
-      const duration = Date.now() - startTime
-      logger.recordPerformance('generateHooks', duration, true)
-
-      return res.json({
-        id: requestId,
-        status: 'success',
-        source: 'cache',
-        hooks: cachedHooks,
-        count: cachedHooks.length,
-        duration: `${duration}ms`,
-        cacheHit: true
-      })
-    }
-
-    // Process with queue
-    const hooks = await requestQueue.enqueue(requestId, async () => {
-      return await aiContentGenerator.generateHooks(profileData, { niche, count, style })
-    }, 1)
-
-    // Cache result
-    contentCache.set(cacheKey, hooks)
-
-    const duration = Date.now() - startTime
-    logger.recordPerformance('generateHooks', duration, true)
-
-    res.json({
-      id: requestId,
-      status: 'success',
-      source: 'generated',
-      hooks,
-      count: hooks.length,
-      duration: `${duration}ms`,
-      cacheHit: false
-    })
-  } catch (error) {
-    logger.error('Error generating hooks', {
-      error: error.message,
-      requestId
-    })
-    logger.recordPerformance('generateHooks', Date.now() - startTime, false)
-
-    res.status(500).json({
-      error: 'Failed to generate hooks',
-      message: error.message,
-      requestId
-    })
-  }
-}
-
-/**
- * Generate captions for social media
- */
-export const generateCaptions = async (req, res, next) => {
-  const startTime = Date.now()
-  const requestId = uuidv4()
-
-  try {
-    const {
-      profileData,
-      topic = 'general',
-      count = 5,
-      tone = 'professional',
-      includeEmojis = true,
-      includeHashtags = false
-    } = req.body
-
-    if (!profileData) {
-      return res.status(400).json({
-        error: 'Profile data is required',
-        requestId
-      })
-    }
-
-    // Check cache
-    const cacheKey = contentCache.generateKey('captions', profileData.username, count, tone)
-    const cachedCaptions = contentCache.get(cacheKey)
-
-    if (cachedCaptions) {
-      const duration = Date.now() - startTime
-      logger.recordPerformance('generateCaptions', duration, true)
-
-      return res.json({
-        id: requestId,
-        status: 'success',
-        source: 'cache',
-        captions: cachedCaptions,
-        count: cachedCaptions.length,
-        duration: `${duration}ms`,
-        cacheHit: true
-      })
-    }
-
-    // Generate captions
-    const captions = await requestQueue.enqueue(requestId, async () => {
-      return await aiContentGenerator.generateCaptions(
-        profileData,
-        {
-          topic,
-          count,
-          tone,
-          includeEmojis,
-          includeHashtags
-        }
-      )
-    }, 1)
-
-    // Cache result
-    contentCache.set(cacheKey, captions)
-
-    const duration = Date.now() - startTime
-    logger.recordPerformance('generateCaptions', duration, true)
-
-    res.json({
-      id: requestId,
-      status: 'success',
-      source: 'generated',
-      captions,
-      count: captions.length,
-      duration: `${duration}ms`,
-      cacheHit: false
-    })
-  } catch (error) {
-    logger.error('Error generating captions', {
-      error: error.message,
-      requestId
-    })
-    logger.recordPerformance('generateCaptions', Date.now() - startTime, false)
-
-    res.status(500).json({
-      error: 'Failed to generate captions',
-      message: error.message,
-      requestId
-    })
-  }
-}
-
-/**
- * Generate video scripts
- */
-export const generateScripts = async (req, res, next) => {
-  const startTime = Date.now()
-  const requestId = uuidv4()
-
-  try {
-    const {
-      profileData,
-      topic = 'product showcase',
-      duration = '60s',
-      style = 'engaging',
-      count = 3,
-      language = 'en'
-    } = req.body
-
-    if (!profileData) {
-      return res.status(400).json({
-        error: 'Profile data is required',
-        requestId
-      })
-    }
-
-    // Generate scripts
-    const scripts = await requestQueue.enqueue(requestId, async () => {
-      return await aiContentGenerator.generateScripts(
-        profileData,
-        {
-          topic,
-          duration,
-          style,
-          count,
-          language
-        }
-      )
-    }, 2) // Higher priority
-
-    // Save to database
-    try {
-      for (const script of scripts) {
-        await GeneratedScript.create({
-          username: profileData.username,
-          content: script,
-          duration,
-          style,
-          metadata: {
-            requestId,
-            generatedAt: new Date()
-          }
-        })
-      }
-    } catch (dbError) {
-      logger.warn('Failed to save scripts to database', {
-        error: dbError.message
-      })
-    }
-
-    const duration_ms = Date.now() - startTime
-    logger.recordPerformance('generateScripts', duration_ms, true)
-
-    res.json({
-      id: requestId,
-      status: 'success',
-      scripts,
-      count: scripts.length,
-      duration: `${duration_ms}ms`,
-      saved: true
-    })
-  } catch (error) {
-    logger.error('Error generating scripts', {
-      error: error.message,
-      requestId
-    })
-    logger.recordPerformance('generateScripts', Date.now() - startTime, false)
-
-    res.status(500).json({
-      error: 'Failed to generate scripts',
-      message: error.message,
-      requestId
-    })
-  }
-}
-
-/**
- * Generate trending hashtags
- */
-export const generateHashtags = async (req, res, next) => {
-  const startTime = Date.now()
-  const requestId = uuidv4()
-
-  try {
-    const {
-      profileData,
-      topic = 'general',
-      count = 20,
-      trendingOnly = false
-    } = req.body
-
-    if (!profileData) {
-      return res.status(400).json({
-        error: 'Profile data is required',
-        requestId
-      })
-    }
-
-    const hashtags = await requestQueue.enqueue(requestId, async () => {
-      return await aiContentGenerator.generateHashtags(
-        profileData,
-        {
-          topic,
-          count,
-          trendingOnly
-        }
-      )
-    }, 0)
-
-    const duration = Date.now() - startTime
-    logger.recordPerformance('generateHashtags', duration, true)
-
-    res.json({
-      id: requestId,
-      status: 'success',
-      hashtags,
-      count: hashtags.length,
-      duration: `${duration}ms`
-    })
-  } catch (error) {
-    logger.error('Error generating hashtags', {
-      error: error.message,
-      requestId
-    })
-    logger.recordPerformance('generateHashtags', Date.now() - startTime, false)
-
-    res.status(500).json({
-      error: 'Failed to generate hashtags',
-      message: error.message,
-      requestId
-    })
-  }
-}
-
-/**
- * Analyze influencer profile
- */
-export const analyzeInfluencer = async (req, res, next) => {
-  const startTime = Date.now()
-  const requestId = uuidv4()
-
-  try {
-    const { profileData, recentPosts = [] } = req.body
-
-    if (!profileData) {
-      return res.status(400).json({
-        error: 'Profile data is required',
-        requestId
-      })
-    }
-
-    // Check cache
-    const cacheKey = contentCache.generateKey('analysis', profileData.username)
-    const cachedAnalysis = contentCache.get(cacheKey)
-
-    if (cachedAnalysis) {
-      const duration = Date.now() - startTime
-      logger.recordPerformance('analyzeInfluencer', duration, true)
-
-      return res.json({
-        id: requestId,
-        status: 'success',
-        source: 'cache',
-        analysis: cachedAnalysis,
-        duration: `${duration}ms`,
-        cacheHit: true
-      })
-    }
-
-    // Analyze
-    const analysis = await requestQueue.enqueue(requestId, async () => {
-      return await instagramAnalyzer.analyzeInfluencer(profileData, recentPosts)
-    }, 2)
-
-    // Cache result
-    contentCache.set(cacheKey, analysis)
-
-    // Save analytics
-    try {
-      await Analytics.create({
-        influencer: profileData.username,
-        type: 'profile_analysis',
-        data: analysis,
-        metadata: { requestId }
-      })
-    } catch (dbError) {
-      logger.warn('Failed to save analytics', { error: dbError.message })
-    }
-
-    const duration = Date.now() - startTime
-    logger.recordPerformance('analyzeInfluencer', duration, true)
-
-    res.json({
-      id: requestId,
-      status: 'success',
-      source: 'generated',
-      analysis,
-      duration: `${duration}ms`,
-      cacheHit: false
-    })
-  } catch (error) {
-    logger.error('Error analyzing influencer', {
-      error: error.message,
-      requestId
-    })
-    logger.recordPerformance('analyzeInfluencer', Date.now() - startTime, false)
-
-    res.status(500).json({
-      error: 'Failed to analyze influencer',
-      message: error.message,
-      requestId
-    })
-  }
-}
-
-/**
- * Get content generation status
- */
-export const getGenerationStatus = (req, res) => {
-  const { requestId } = req.params
-
-  if (!requestId) {
-    return res.status(400).json({
-      error: 'Request ID is required'
-    })
-  }
-
-  const status = requestQueue.getStatus(requestId)
-
-  res.json({
-    requestId,
-    ...status,
-    queueStats: requestQueue.getMetrics()
+  const result = await agentOrchestrator.generateContent(contentType, {
+    topic,
+    niche: niche || creatorProfile?.niche?.primary || 'general',
+    count: count || 5,
+    duration: duration || 30,
+    creatorProfile: creatorProfile?.toObject() || {}
   })
-}
+
+  const content = await Content.create({
+    userId,
+    type: contentType,
+    topic,
+    niche: niche || creatorProfile?.niche?.primary,
+    content: result,
+    model: 'gemini-flash',
+    generationTimeMs: Date.now() - startTime
+  })
+
+  await user.incrementUsage()
+
+  res.json({
+    success: true,
+    data: {
+      content: result,
+      contentId: content._id,
+      generationTimeMs: Date.now() - startTime,
+      usage: user.checkUsageLimit()
+    }
+  })
+})
 
 /**
- * Get controller metrics and statistics
+ * POST /api/ai/analyze-profile
  */
-export const getMetrics = (req, res) => {
-  res.json({
-    cache: contentCache.getStats(),
-    queue: requestQueue.getMetrics(),
-    performance: {
-      hooks: logger.getMetrics('generateHooks'),
-      captions: logger.getMetrics('generateCaptions'),
-      scripts: logger.getMetrics('generateScripts'),
-      hashtags: logger.getMetrics('generateHashtags'),
-      analysis: logger.getMetrics('analyzeInfluencer')
+export const analyzeProfile = asyncHandler(async (req, res) => {
+  const { instagramUrl } = req.body
+  const userId = req.user.id
+
+  const username = instagramUrl
+    .replace(/^(https?:\/\/)?(www\.)?instagram\.com\//i, '')
+    .replace(/\/$/, '').replace(/^@/, '')
+    .split('/')[0].split('?')[0]
+
+  if (!username) throw new AppError('Invalid Instagram URL', 400)
+
+  const user = await User.findById(userId)
+  const usage = user.checkUsageLimit()
+  if (!usage.canGenerate) throw new AppError('Daily limit reached.', 429)
+
+  const { default: instagramScraper } = await import('../services/instagramScraper.js')
+  const profileData = await instagramScraper.scrapeProfile(username)
+  const posts = await instagramScraper.getRecentPosts(username, 15)
+
+  const analysis = await agentOrchestrator.analyzeCreatorProfile(
+    { ...profileData, username }, posts
+  )
+
+  const creatorProfile = await CreatorProfile.findOneAndUpdate(
+    { userId },
+    {
+      userId, instagramUsername: username,
+      profileData: {
+        fullName: profileData.fullName, biography: profileData.biography,
+        followers: profileData.followers, following: profileData.following,
+        totalPosts: profileData.posts, avatar: profileData.avatar,
+        isVerified: profileData.isVerified, engagementRate: profileData.engagement,
+        lastScrapedAt: new Date()
+      },
+      voiceProfile: analysis.profileAnalysis?.voiceProfile || {},
+      niche: analysis.profileAnalysis?.niche || {},
+      audience: analysis.profileAnalysis?.audience || {},
+      contentStrategy: analysis.profileAnalysis?.contentStrategy || {},
+      healthMetrics: analysis.profileAnalysis?.healthMetrics || {},
+      lastAnalyzedAt: new Date()
     },
-    timestamp: new Date().toISOString()
-  })
-}
+    { upsert: true, new: true }
+  )
 
-/**
- * Clear cache
- */
-export const clearCache = (req, res) => {
-  contentCache.clear()
+  user.instagram = { username, profileUrl: instagramUrl, connectedAt: new Date() }
+  await user.incrementUsage()
 
   res.json({
-    status: 'success',
-    message: 'Cache cleared',
-    cacheStats: contentCache.getStats()
+    success: true,
+    data: { profile: creatorProfile, analysis, usage: user.checkUsageLimit() }
   })
-}
+})
 
-export default {
-  generateHooks,
-  generateCaptions,
-  generateScripts,
-  generateHashtags,
-  analyzeInfluencer,
-  getGenerationStatus,
-  getMetrics,
-  clearCache
-}
+/**
+ * GET /api/ai/history
+ */
+export const getHistory = asyncHandler(async (req, res) => {
+  const { type, page = 1, limit = 20 } = req.query
+  const query = { userId: req.user.id }
+  if (type) query.type = type
+
+  const contents = await Content.find(query)
+    .sort({ createdAt: -1 })
+    .skip((page - 1) * limit)
+    .limit(Number(limit))
+
+  const total = await Content.countDocuments(query)
+
+  res.json({
+    success: true,
+    data: { contents, pagination: { page: Number(page), limit: Number(limit), total, pages: Math.ceil(total / limit) } }
+  })
+})
+
+/**
+ * GET /api/ai/stats
+ */
+export const getAIStats = asyncHandler(async (req, res) => {
+  const user = await User.findById(req.user.id)
+  const totalGenerated = await Content.countDocuments({ userId: req.user.id })
+
+  res.json({
+    success: true,
+    data: {
+      totalGenerated,
+      usage: user.checkUsageLimit(),
+      llmStats: agentOrchestrator.getStats()
+    }
+  })
+})
